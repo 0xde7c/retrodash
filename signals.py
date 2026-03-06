@@ -7,6 +7,7 @@ import pandas as pd
 import pandas_ta as ta
 import logging
 from config import *
+from config import get_session_tier, SESSION_MIN_SCORE
 
 log = logging.getLogger("retrodash.signals")
 
@@ -188,11 +189,14 @@ def evaluate_signal(m1_df, m5_df, h1_df, spread):
         if rsi <= RSI_LONG_MIN:
             return None, f"rsi_too_low ({rsi:.1f} <= {RSI_LONG_MIN})", indicators
 
-        # Signal quality score (M5 slope and H1 add bonus points but don't block)
+        # Signal quality score — session-aware threshold
         score = _signal_score(direction, rsi, atr_pips, m5_sl, h1_ema200, h1_price, m1_df)
         indicators['score'] = score
-        if score < MIN_SIGNAL_SCORE:
-            return None, f"weak_signal (score={score:.1f} < {MIN_SIGNAL_SCORE})", indicators
+        tier = get_session_tier()
+        min_score = SESSION_MIN_SCORE.get(tier, MIN_SIGNAL_SCORE)
+        indicators['session'] = tier
+        if score < min_score:
+            return None, f"weak_signal (score={score:.1f} < {min_score} [{tier}])", indicators
 
         return 'long', None, indicators
 
@@ -205,11 +209,14 @@ def evaluate_signal(m1_df, m5_df, h1_df, spread):
         if rsi >= RSI_SHORT_MAX:
             return None, f"rsi_too_high ({rsi:.1f} >= {RSI_SHORT_MAX})", indicators
 
-        # Signal quality score (M5 slope and H1 add bonus points but don't block)
+        # Signal quality score — session-aware threshold
         score = _signal_score(direction, rsi, atr_pips, m5_sl, h1_ema200, h1_price, m1_df)
         indicators['score'] = score
-        if score < MIN_SIGNAL_SCORE:
-            return None, f"weak_signal (score={score:.1f} < {MIN_SIGNAL_SCORE})", indicators
+        tier = get_session_tier()
+        min_score = SESSION_MIN_SCORE.get(tier, MIN_SIGNAL_SCORE)
+        indicators['session'] = tier
+        if score < min_score:
+            return None, f"weak_signal (score={score:.1f} < {min_score} [{tier}])", indicators
 
         return 'short', None, indicators
 

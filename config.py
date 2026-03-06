@@ -52,19 +52,34 @@ ATR_MAX_PIPS = 60
 MIN_SIGNAL_SCORE = 20       # minimum quality score (0-100) — low for testing
 
 # ══════════════════════════════════════════════════════════════════════════
-# SL / TP (fixed pips)
+# SL / TP — ATR-dynamic
 # ══════════════════════════════════════════════════════════════════════════
+ATR_SL_MULTIPLIER = 1.2            # SL = 1.2 × ATR
+ATR_TP_MULTIPLIER = 2.0            # TP = 2.0 × ATR (1:1.67 R:R)
+SL_MIN_PIPS = 5                    # floor — never tighter than 5 pips
+SL_MAX_PIPS = 12                   # ceiling — never wider than 12 pips
+TP_MIN_PIPS = 8                    # floor
+TP_MAX_PIPS = 35                   # ceiling
+
+# Fallback fixed (used if ATR unavailable)
 SL_PIPS = 8
 TP_PIPS = 10
-SL_DISTANCE = SL_PIPS * PIP_SIZE   # $0.80 in price
-TP_DISTANCE = TP_PIPS * PIP_SIZE   # $1.00 in price
+SL_DISTANCE = SL_PIPS * PIP_SIZE
+TP_DISTANCE = TP_PIPS * PIP_SIZE
+
+# ══════════════════════════════════════════════════════════════════════════
+# Trailing stop
+# ══════════════════════════════════════════════════════════════════════════
+TRAIL_ACTIVATE_ATR = 0.5           # activate after 0.5 × ATR profit
+TRAIL_DISTANCE_ATR = 0.6           # trail at 0.6 × ATR behind price
+TRAIL_MAX_HOLD_SECS = 600          # 10 min if trailing active (vs 8 normal)
 
 # ══════════════════════════════════════════════════════════════════════════
 # Risk controls
 # ══════════════════════════════════════════════════════════════════════════
 MAX_TRADES_PER_DAY = 30
 DAILY_LOSS_LIMIT = 20.0             # USD
-MAX_POSITION_TIME = 300             # 5 minutes
+MAX_POSITION_TIME = 480             # 8 minutes (10 if trailing active)
 STARTING_BALANCE = 200.0
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -72,6 +87,27 @@ STARTING_BALANCE = 200.0
 # ══════════════════════════════════════════════════════════════════════════
 SESSION_START_HOUR = 0
 SESSION_END_HOUR = 24
+
+# Session tiers — gold moves most during London/NY
+# PRIME:  London+NY overlap (13:00-17:00 UTC) — full aggression
+# ACTIVE: London (07:00-13:00) or NY (17:00-21:00) — normal
+# QUIET:  Asian (21:00-07:00) — tighter filters, less risk
+def get_session_tier():
+    """Return 'prime', 'active', or 'quiet' based on UTC hour."""
+    hour = datetime.now(timezone.utc).hour
+    if 13 <= hour < 17:
+        return "prime"      # London/NY overlap — gold's biggest moves
+    elif 7 <= hour < 13 or 17 <= hour < 21:
+        return "active"     # London or NY solo
+    else:
+        return "quiet"      # Asian session — low volume
+
+# Session-specific score thresholds
+SESSION_MIN_SCORE = {
+    "prime": 15,            # lower bar — more opportunities during peak hours
+    "active": 20,           # normal
+    "quiet": 35,            # higher bar — only take strong setups in Asian
+}
 
 # ══════════════════════════════════════════════════════════════════════════
 # Polling intervals (seconds)

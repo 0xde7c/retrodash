@@ -126,8 +126,9 @@ class RetrodashEngine:
         # Determine entry price
         entry_price = ask if direction == "long" else bid
 
-        # Open trade
-        pos = await self.bot.open_trade(direction, entry_price)
+        # Open trade with ATR for dynamic SL/TP
+        atr = indicators.get('atr14')
+        pos = await self.bot.open_trade(direction, entry_price, atr=atr)
         if pos:
             await self.tg.notify_entry(direction, entry_price, pos["sl"], pos["tp"], indicators)
             return True
@@ -153,7 +154,7 @@ class RetrodashEngine:
         pos = self.bot.open_position
         current_price = bid if pos["direction"] == "long" else ask
 
-        # Demo mode: check SL/TP
+        # Demo mode: check SL/TP/trailing
         if DEMO_MODE:
             hit = self.bot.check_demo_sl_tp(current_price)
             if hit == "sl":
@@ -162,6 +163,10 @@ class RetrodashEngine:
                 return
             elif hit == "tp":
                 record = await self.bot.close_trade(pos["tp"], reason="take_profit")
+                await self.tg.notify_exit(record)
+                return
+            elif hit == "trail_exit":
+                record = await self.bot.close_trade(current_price, reason="trail_exit")
                 await self.tg.notify_exit(record)
                 return
 
