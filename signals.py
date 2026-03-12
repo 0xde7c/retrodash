@@ -1,270 +1,232 @@
 """
-Signal generation — indicator computation and entry evaluation.
-Uses pandas + pandas_ta on OHLCV candles from MetaAPI.
+Signal generation — 5m RSI(9) mean-reversion scalper.
+Pure math functions, no external TA libraries.
 """
 
-import pandas as pd
-import pandas_ta as ta
 import logging
-from config import *
-from config import get_session_tier, SESSION_MIN_SCORE
+from datetime import datetime, timezone
+from config import (
+    RSI_PERIOD, RSI_OS, RSI_OB, RSI_TURN_DELTA,
+    ATR_PERIOD, ATR_MIN, ATR_MAX,
+    ADX_PERIOD, ADX_MAX,
+    SL_ATR_MULT, SL_MIN, SL_MAX, SL_HARD,
+    TP_RR, TP_MIN, TP_MAX, SESSION_START, SESSION_END,
+)
 
 log = logging.getLogger("retrodash.signals")
 
 
-def build_dataframe(candles):
-    """Convert list of candle dicts to pandas DataFrame."""
-    if not candles:
-        return pd.DataFrame()
-    df = pd.DataFrame(candles)
-    for col in ['open', 'high', 'low', 'close']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    if 'volume' in df.columns:
-        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-    return df
-
-
-def compute_m1_indicators(df):
-    """Compute all M1 indicators: EMA 5/13/34, RSI(7), ATR(14)."""
-    if len(df) < EMA_TREND + 10:
-        return df
-    df['ema_fast'] = ta.ema(df['close'], length=EMA_FAST)
-    df['ema_slow'] = ta.ema(df['close'], length=EMA_SLOW)
-    df['ema_trend'] = ta.ema(df['close'], length=EMA_TREND)
-    df['rsi7'] = ta.rsi(df['close'], length=RSI_PERIOD)
-    df['atr14'] = ta.atr(df['high'], df['low'], df['close'], length=ATR_PERIOD)
-    return df
-
-
-def compute_m5_ema(df):
-    """Compute M5 EMA 13 (confirmation)."""
-    if len(df) < EMA_SLOW + 5:
-        return df
-    df['ema_slow'] = ta.ema(df['close'], length=EMA_SLOW)
-    return df
-
-
-def compute_h1_ema(df):
-    """Compute H1 EMA 200."""
-    if len(df) < EMA_BIAS + 5:
-        return df
-    df['ema200'] = ta.ema(df['close'], length=EMA_BIAS)
-    return df
-
-
-def detect_crossover(df):
+def compute_rsi(closes: list, period: int = RSI_PERIOD):
     """
-    Detect EMA fast/slow crossover on last two completed candles.
-    Returns 'long', 'short', or None.
+    Wilder's smoothed RSI.
+    Needs at least period + 1 closes.
+    Returns float RSI value or None if insufficient data.
     """
-    if len(df) < 3:
+    if len(closes) < period + 1:
         return None
 
-    prev_fast = df['ema_fast'].iloc[-2]
-    prev_slow = df['ema_slow'].iloc[-2]
-    curr_fast = df['ema_fast'].iloc[-1]
-    curr_slow = df['ema_slow'].iloc[-1]
+    gains = []
+    losses = []
+    for i in range(1, period + 1):
+        delta = closes[i] - closes[i - 1]
+        if delta > 0:
+            gains.append(delta)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(abs(delta))
 
-    if pd.isna(prev_fast) or pd.isna(curr_fast) or pd.isna(prev_slow) or pd.isna(curr_slow):
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
+    for i in range(period + 1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        gain = delta if delta > 0 else 0.0
+        loss = abs(delta) if delta < 0 else 0.0
+
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return round(rsi, 2)
+
+
+def compute_atr(candles: list, period: int = ATR_PERIOD):
+    """
+    True Range with Wilder's smoothing.
+    Each candle needs 'high', 'low', 'close' keys.
+    Needs at least period + 1 candles.
+    Returns float ATR value or None if insufficient data.
+    """
+    if len(candles) < period + 1:
         return None
 
-    # Bullish: EMA9 crosses above EMA21
-    if prev_fast <= prev_slow and curr_fast > curr_slow:
-        return 'long'
-    # Bearish: EMA9 crosses below EMA21
-    if prev_fast >= prev_slow and curr_fast < curr_slow:
-        return 'short'
+    true_ranges = []
+    for i in range(1, len(candles)):
+        high = candles[i]['high']
+        low = candles[i]['low']
+        prev_close = candles[i - 1]['close']
 
-    return None
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+        true_ranges.append(tr)
+
+    if len(true_ranges) < period:
+        return None
+
+    atr = sum(true_ranges[:period]) / period
+
+    for i in range(period, len(true_ranges)):
+        atr = (atr * (period - 1) + true_ranges[i]) / period
+
+    return round(atr, 2)
 
 
-def ema_slope(df, col='ema_slow', lookback=3):
-    """Calculate slope of an EMA over the last N candles. Returns float."""
-    if len(df) < lookback + 1:
-        return 0.0
-    vals = df[col].iloc[-(lookback + 1):].values
-    if any(pd.isna(vals)):
-        return 0.0
-    return float(vals[-1] - vals[0])
-
-
-def evaluate_signal(m1_df, m5_df, h1_df, spread):
+def compute_adx(candles: list, period: int = ADX_PERIOD):
     """
-    Evaluate all entry conditions.
-    Primary: M1 candles. Confirmation: M5 slope. Bias: H1 EMA 200.
-
-    Returns:
-        (direction, skip_reason, indicators)
-        direction: 'long', 'short', or None
-        skip_reason: string explaining why signal was skipped, or None
-        indicators: dict of current indicator values
+    ADX (Average Directional Index) with Wilder's smoothing.
+    Needs at least period * 2 + 1 candles.
+    Returns float ADX value or None if insufficient data.
     """
-    indicators = {}
+    if len(candles) < period * 2 + 1:
+        return None
 
-    # ── Compute M1 indicators ────────────────────────────────────────────
-    m1_df = compute_m1_indicators(m1_df)
-    if len(m1_df) < EMA_TREND + 10:
-        return None, "not_enough_m1_data", indicators
+    # Compute +DM, -DM, TR for each bar
+    plus_dm_list = []
+    minus_dm_list = []
+    tr_list = []
 
-    latest = m1_df.iloc[-1]
-    price = float(latest['close'])
-    indicators = {
-        'price': price,
-        'ema_fast': float(latest['ema_fast']) if not pd.isna(latest['ema_fast']) else None,
-        'ema_slow': float(latest['ema_slow']) if not pd.isna(latest['ema_slow']) else None,
-        'ema_trend': float(latest['ema_trend']) if not pd.isna(latest['ema_trend']) else None,
-        'rsi7': float(latest['rsi7']) if not pd.isna(latest['rsi7']) else None,
-        'atr14': float(latest['atr14']) if not pd.isna(latest['atr14']) else None,
+    for i in range(1, len(candles)):
+        high = candles[i]['high']
+        low = candles[i]['low']
+        prev_high = candles[i - 1]['high']
+        prev_low = candles[i - 1]['low']
+        prev_close = candles[i - 1]['close']
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+
+        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+
+        plus_dm_list.append(plus_dm)
+        minus_dm_list.append(minus_dm)
+        tr_list.append(tr)
+
+    if len(tr_list) < period:
+        return None
+
+    # Initial smoothed values (simple sum of first `period`)
+    smoothed_plus_dm = sum(plus_dm_list[:period])
+    smoothed_minus_dm = sum(minus_dm_list[:period])
+    smoothed_tr = sum(tr_list[:period])
+
+    # Compute DX values for ADX averaging
+    dx_values = []
+
+    for i in range(period, len(tr_list)):
+        # Wilder's smoothing
+        smoothed_plus_dm = smoothed_plus_dm - (smoothed_plus_dm / period) + plus_dm_list[i]
+        smoothed_minus_dm = smoothed_minus_dm - (smoothed_minus_dm / period) + minus_dm_list[i]
+        smoothed_tr = smoothed_tr - (smoothed_tr / period) + tr_list[i]
+
+        if smoothed_tr == 0:
+            dx_values.append(0.0)
+            continue
+
+        plus_di = 100 * smoothed_plus_dm / smoothed_tr
+        minus_di = 100 * smoothed_minus_dm / smoothed_tr
+
+        di_sum = plus_di + minus_di
+        if di_sum == 0:
+            dx_values.append(0.0)
+        else:
+            dx = 100 * abs(plus_di - minus_di) / di_sum
+            dx_values.append(dx)
+
+    if len(dx_values) < period:
+        return None
+
+    # ADX = Wilder's smoothed average of DX
+    adx = sum(dx_values[:period]) / period
+    for i in range(period, len(dx_values)):
+        adx = (adx * (period - 1) + dx_values[i]) / period
+
+    return round(adx, 2)
+
+
+def evaluate_signal(rsi: float, prev_rsi: float, atr: float, price: float, adx: float = None):
+    """
+    Check for RSI mean-reversion entry signal.
+
+    Oversold LONG:  prev_rsi <= RSI_OS and rsi > prev_rsi + RSI_TURN_DELTA
+    Overbought SHORT: prev_rsi >= RSI_OB and rsi < prev_rsi - RSI_TURN_DELTA
+
+    Filters: session, ATR floor/ceiling, ADX range filter.
+    Returns dict with signal info or None.
+    """
+    if rsi is None or prev_rsi is None or atr is None:
+        return None
+
+    # Session filter
+    now = datetime.now(timezone.utc)
+    if not (SESSION_START <= now.hour < SESSION_END):
+        return None
+
+    # ATR volatility filter — floor and ceiling
+    if atr < ATR_MIN:
+        log.info(f"ATR ${atr:.2f} < ${ATR_MIN:.2f} — too quiet, skipping")
+        return None
+    if atr > ATR_MAX:
+        log.info(f"ATR ${atr:.2f} > ${ATR_MAX:.2f} — too volatile, skipping")
+        return None
+
+    side = None
+
+    # Oversold → LONG
+    if prev_rsi <= RSI_OS and rsi > prev_rsi + RSI_TURN_DELTA:
+        side = "buy"
+
+    # Overbought → SHORT
+    elif prev_rsi >= RSI_OB and rsi < prev_rsi - RSI_TURN_DELTA:
+        side = "sell"
+
+    if side is None:
+        return None
+
+    # SL = ATR * mult, clamped
+    sl_distance = atr * SL_ATR_MULT
+    sl_distance = max(sl_distance, SL_MIN)
+    sl_distance = min(sl_distance, SL_MAX)
+
+    if sl_distance > SL_HARD:
+        sl_distance = SL_HARD
+
+    # TP = SL * R:R, clamped
+    tp_distance = sl_distance * TP_RR
+    tp_distance = max(tp_distance, TP_MIN)
+    tp_distance = min(tp_distance, TP_MAX)
+
+    return {
+        "side": side,
+        "sl_distance": round(sl_distance, 2),
+        "tp_distance": round(tp_distance, 2),
+        "atr": atr,
+        "adx": adx,
+        "rsi": rsi,
+        "prev_rsi": prev_rsi,
+        "turn_delta": round(abs(rsi - prev_rsi), 2),
     }
-
-    # ── Check for EMA fast/slow crossover ─────────────────────────────────
-    crossover = detect_crossover(m1_df)
-    if crossover is None:
-        return None, None, indicators     # No crossover — not a skip, just no signal
-
-    direction = crossover
-    indicators['crossover'] = direction
-
-    # ── Session filter ───────────────────────────────────────────────────
-    if not is_session_active():
-        from datetime import datetime, timezone
-        hour = datetime.now(timezone.utc).hour
-        return None, f"session_filter (hour={hour}, allowed {SESSION_START_HOUR}-{SESSION_END_HOUR})", indicators
-
-    # ── News blackout ────────────────────────────────────────────────────
-    if is_news_blackout():
-        return None, "news_blackout", indicators
-
-    # ── Spread filter ────────────────────────────────────────────────────
-    spread_pips = spread / PIP_SIZE if spread else 0
-    indicators['spread_pips'] = round(spread_pips, 1)
-    if spread_pips > SPREAD_MAX_PIPS:
-        return None, f"spread_too_wide ({spread_pips:.1f} pips > {SPREAD_MAX_PIPS})", indicators
-
-    # ── ATR filter ───────────────────────────────────────────────────────
-    atr = indicators['atr14']
-    if atr is None:
-        return None, "atr_not_ready", indicators
-    atr_pips = atr / PIP_SIZE
-    indicators['atr_pips'] = round(atr_pips, 1)
-    if atr_pips < ATR_MIN_PIPS:
-        return None, f"atr_too_low ({atr_pips:.1f} < {ATR_MIN_PIPS})", indicators
-    if atr_pips > ATR_MAX_PIPS:
-        return None, f"atr_too_high ({atr_pips:.1f} > {ATR_MAX_PIPS})", indicators
-
-    # ── Indicator readiness ──────────────────────────────────────────────
-    ema_trend = indicators['ema_trend']
-    rsi = indicators['rsi7']
-    if ema_trend is None or rsi is None:
-        return None, "indicators_not_ready", indicators
-
-    # ── M5 EMA slope (confirmation) ──────────────────────────────────────
-    m5_df = compute_m5_ema(m5_df)
-    m5_sl = ema_slope(m5_df, 'ema_slow', lookback=3)
-    indicators['m5_slope'] = round(m5_sl, 4)
-
-    # ── H1 EMA 200 bias ─────────────────────────────────────────────────
-    h1_df = compute_h1_ema(h1_df)
-    h1_ema200 = None
-    h1_price = None
-    if len(h1_df) > EMA_BIAS and 'ema200' in h1_df.columns:
-        val = h1_df['ema200'].iloc[-1]
-        if not pd.isna(val):
-            h1_ema200 = float(val)
-    if len(h1_df) > 0:
-        h1_price = float(h1_df['close'].iloc[-1])
-    indicators['h1_ema200'] = h1_ema200
-    indicators['h1_price'] = h1_price
-
-    # ══════════════════════════════════════════════════════════════════════
-    # DIRECTION-SPECIFIC CHECKS
-    # ══════════════════════════════════════════════════════════════════════
-    if direction == 'long':
-        # 1. Price above EMA trend
-        if price <= ema_trend:
-            return None, f"price_below_ema_trend ({price:.2f} <= {ema_trend:.2f})", indicators
-
-        # 2. RSI > 50
-        if rsi <= RSI_LONG_MIN:
-            return None, f"rsi_too_low ({rsi:.1f} <= {RSI_LONG_MIN})", indicators
-
-        # Signal quality score — session-aware threshold
-        score = _signal_score(direction, rsi, atr_pips, m5_sl, h1_ema200, h1_price, m1_df)
-        indicators['score'] = score
-        tier = get_session_tier()
-        min_score = SESSION_MIN_SCORE.get(tier, MIN_SIGNAL_SCORE)
-        indicators['session'] = tier
-        if score < min_score:
-            return None, f"weak_signal (score={score:.1f} < {min_score} [{tier}])", indicators
-
-        return 'long', None, indicators
-
-    else:  # short
-        # 1. Price below EMA trend
-        if price >= ema_trend:
-            return None, f"price_above_ema_trend ({price:.2f} >= {ema_trend:.2f})", indicators
-
-        # 2. RSI < 50
-        if rsi >= RSI_SHORT_MAX:
-            return None, f"rsi_too_high ({rsi:.1f} >= {RSI_SHORT_MAX})", indicators
-
-        # Signal quality score — session-aware threshold
-        score = _signal_score(direction, rsi, atr_pips, m5_sl, h1_ema200, h1_price, m1_df)
-        indicators['score'] = score
-        tier = get_session_tier()
-        min_score = SESSION_MIN_SCORE.get(tier, MIN_SIGNAL_SCORE)
-        indicators['session'] = tier
-        if score < min_score:
-            return None, f"weak_signal (score={score:.1f} < {min_score} [{tier}])", indicators
-
-        return 'short', None, indicators
-
-
-def _signal_score(direction, rsi, atr_pips, m5_slope, h1_ema200, h1_price, m1_df):
-    """
-    Score a signal 0-100. Higher = stronger setup.
-    Factors: crossover gap, RSI momentum, ATR sweet spot, M5 slope, H1 alignment.
-    """
-    score = 0.0
-
-    # 1. Crossover gap strength (0-25 pts)
-    #    Bigger gap between fast and slow EMA = stronger momentum
-    if len(m1_df) >= 2:
-        fast = m1_df['ema_fast'].iloc[-1]
-        slow = m1_df['ema_slow'].iloc[-1]
-        if not pd.isna(fast) and not pd.isna(slow):
-            gap = abs(fast - slow) / PIP_SIZE  # in pips
-            score += min(gap * 2.5, 25)  # 10 pip gap = 25 pts
-
-    # 2. RSI momentum (0-25 pts)
-    #    Long: further above 50 = stronger. Short: further below 50 = stronger.
-    if direction == 'long':
-        rsi_strength = max(rsi - 50, 0)  # 0-50 range
-    else:
-        rsi_strength = max(50 - rsi, 0)
-    score += min(rsi_strength, 25)  # 25+ away from 50 = max pts
-
-    # 3. ATR sweet spot (0-20 pts)
-    #    Best range: 8-25 pips. Too low = no movement. Too high = choppy.
-    if 8 <= atr_pips <= 25:
-        score += 20
-    elif 5 <= atr_pips <= 40:
-        score += 10
-    else:
-        score += 5
-
-    # 4. M5 slope strength (0-15 pts)
-    slope_strength = abs(m5_slope) / PIP_SIZE
-    score += min(slope_strength * 3, 15)
-
-    # 5. H1 alignment (0-15 pts)
-    if h1_ema200 is not None and h1_price is not None:
-        if direction == 'long' and h1_price > h1_ema200:
-            h1_gap = (h1_price - h1_ema200) / h1_ema200 * 100  # % above
-            score += min(h1_gap * 5, 15)
-        elif direction == 'short' and h1_price < h1_ema200:
-            h1_gap = (h1_ema200 - h1_price) / h1_ema200 * 100
-            score += min(h1_gap * 5, 15)
-
-    return round(score, 1)
